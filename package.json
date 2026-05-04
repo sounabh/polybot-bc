@@ -1,7 +1,7 @@
 {
   "name": "polymarket-ai-bot",
   "version": "1.0.0",
-  "description": "Polymarket AI Trading Bot with Bullpen CLI + full risk management",
+  "description": "Polymarket AI Trading Bot — Gamma, Data API, CLOB v2",
   "main": "server/index.js",
   "scripts": {
     "start": "node index.js",

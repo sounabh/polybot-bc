@@ -57,20 +57,185 @@ async function resolveTagId(tagSlug) {
   return id != null ? id : null;
 }
 
-function parseOutcomePriceArray(m) {
-  let op = m.outcomePrices;
-  if (typeof op === 'string') {
+function parseJsonArray(v) {
+  if (v == null) return [];
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'string') {
     try {
-      op = JSON.parse(op);
+      const j = JSON.parse(v);
+      return Array.isArray(j) ? j : [];
     } catch {
-      op = [];
+      return [];
     }
   }
-  return Array.isArray(op) ? op.map(x => parseFloat(x)).filter(n => Number.isFinite(n)) : [];
+  return [];
+}
+
+function parseOutcomePriceArray(m) {
+  const op = parseJsonArray(m.outcomePrices);
+  return op.map(x => parseFloat(x)).filter(n => Number.isFinite(n));
+}
+
+/** Gamma returns outcomes / clobTokenIds as JSON strings — build token rows for pricing + CLOB */
+function buildTokensFromGamma(m) {
+  if (Array.isArray(m.tokens) && m.tokens.length) return m.tokens;
+  const labels  = parseJsonArray(m.outcomes).map(x => String(x));
+  const prices  = parseJsonArray(m.outcomePrices).map(x => parseFloat(x));
+  const tokIds  = parseJsonArray(m.clobTokenIds).map(x => String(x));
+  const n       = Math.max(labels.length, tokIds.length, prices.length);
+  const tokens  = [];
+  for (let i = 0; i < n; i++) {
+    tokens.push({
+      outcome: labels[i] || `Outcome ${i}`,
+      price:   Number.isFinite(prices[i]) ? prices[i] : NaN,
+      tokenId: tokIds[i] || null,
+    });
+  }
+  return tokens;
+}
+
+function eventToCtx(ev) {
+  if (!ev || typeof ev !== 'object') return null;
+  const img = ev.image || ev.featuredImage || ev.icon || null;
+  return {
+    image:    img,
+    icon:     ev.icon || null,
+    category: ev.category || null,
+    tags:     ev.tags,
+    eventSlug: ev.slug || null,
+    eventTitle: ev.title || null,
+  };
+}
+
+async function fetchPublicProfile(address) {
+  if (!address || !/^0x[a-fA-F0-9]{40}$/i.test(address)) return null;
+  const url = `${GAMMA}/public-profile?address=${encodeURIComponent(address)}`;
+  return apiFetch(url, { allow404: true });
+}
+
+/** Polymarket indexes positions/activity by proxy wallet; resolve from profile + positions */
+async function resolveDataUser(signerAddr) {
+  const a = (signerAddr || '').toLowerCase();
+  const prof = await fetchPublicProfile(signerAddr).catch(() => null);
+  const fromProfile =
+    prof?.proxyWallet && /^0x[a-fA-F0-9]{40}$/i.test(prof.proxyWallet) ? prof.proxyWallet : null;
+
+  const rows = await apiFetch(`${DATA}/positions?user=${encodeURIComponent(signerAddr)}&sizeThreshold=0.001&limit=30`);
+  const list = Array.isArray(rows) ? rows : [];
+  const fromPos =
+    list[0]?.proxyWallet && /^0x[a-fA-F0-9]{40}$/i.test(list[0].proxyWallet) ? list[0].proxyWallet : null;
+
+  for (const c of [fromProfile, fromPos]) {
+    if (c && c.toLowerCase() !== a) return c;
+  }
+  return signerAddr;
 }
 
 const CTF_EXCHANGE  = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
 const USDC_DECIMALS = 6;
+
+/** Polymarket collateral (pUSD) on Polygon — see https://docs.polymarket.com/resources/contracts */
+const DEFAULT_COLLATERAL = '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB';
+
+const ERC20_MIN_ABI = [
+  'function balanceOf(address account) view returns (uint256)',
+  'function decimals() view returns (uint8)',
+];
+
+let _polygonRpcOk = null;
+
+function collateralTokenAddress() {
+  const a = (process.env.POLYGON_COLLATERAL_TOKEN || DEFAULT_COLLATERAL).trim();
+  return /^0x[a-fA-F0-9]{40}$/i.test(a) ? a : DEFAULT_COLLATERAL;
+}
+
+function getPolygonRpcStatus() {
+  return _polygonRpcOk;
+}
+
+async function checkPolygonRpc() {
+  const url = (process.env.POLYGON_RPC_URL || '').trim();
+  if (!url) {
+    _polygonRpcOk = null;
+    console.warn('[Chain] POLYGON_RPC_URL not set — collateral balance uses API only (often $0)');
+    return null;
+  }
+  try {
+    const p = new ethers.JsonRpcProvider(url);
+    await p.getBlockNumber();
+    _polygonRpcOk = true;
+    console.log('✅ Polygon RPC: OK (on-chain pUSD balance enabled)');
+    return true;
+  } catch (e) {
+    _polygonRpcOk = false;
+    console.warn('[Chain] Polygon RPC unreachable:', e.message);
+    return false;
+  }
+}
+
+/**
+ * Tradable collateral (pUSD) balance for the Polymarket proxy / wallet address.
+ * Requires POLYGON_RPC_URL in .env.
+ */
+async function getCollateralBalance(walletAddress) {
+  const rpc = (process.env.POLYGON_RPC_URL || '').trim();
+  if (!rpc || !walletAddress || !/^0x[a-fA-F0-9]{40}$/i.test(walletAddress)) return null;
+  try {
+    const provider = new ethers.JsonRpcProvider(rpc);
+    const token    = new ethers.Contract(collateralTokenAddress(), ERC20_MIN_ABI, provider);
+    const [raw, dec] = await Promise.all([
+      token.balanceOf(walletAddress),
+      token.decimals().catch(() => 6),
+    ]);
+    return parseFloat(ethers.formatUnits(raw, Number(dec)));
+  } catch (e) {
+    console.warn('[Chain] balanceOf failed:', e.message);
+    return null;
+  }
+}
+
+async function getIntegrationHealth() {
+  const [tags, dataPing, clobTime] = await Promise.all([
+    apiFetch(`${GAMMA}/tags?limit=1`),
+    apiFetch(`${DATA}/`),
+    apiFetch(`${CLOB}/time`),
+  ]);
+  return {
+    gamma:           !!tags,
+    dataApi:         dataPing != null,
+    clob:            clobTime != null,
+    polygonRpc:      _polygonRpcOk,
+    collateralToken: collateralTokenAddress(),
+  };
+}
+
+async function getGammaTags(limit = 500) {
+  const lim = Math.min(Math.max(parseInt(limit, 10) || 500, 1), 2000);
+  const d   = await apiFetch(`${GAMMA}/tags?limit=${lim}`);
+  return Array.isArray(d) ? d : [];
+}
+
+/** CLOB v2 public reads — all trading still goes through placeTrade + wallet */
+async function clobTokenPrice(tokenId, side = 'buy') {
+  if (!tokenId) return null;
+  const s = /^sell/i.test(String(side)) ? 'SELL' : 'BUY';
+  return apiFetch(`${CLOB}/price?token_id=${encodeURIComponent(tokenId)}&side=${s}`);
+}
+
+async function clobMidpoint(tokenId) {
+  if (!tokenId) return null;
+  return apiFetch(`${CLOB}/midpoint?token_id=${encodeURIComponent(tokenId)}`);
+}
+
+async function clobSpread(tokenId) {
+  if (!tokenId) return null;
+  return apiFetch(`${CLOB}/spread?token_id=${encodeURIComponent(tokenId)}`);
+}
+
+async function clobOrderBook(tokenId) {
+  if (!tokenId) return null;
+  return apiFetch(`${CLOB}/book?token_id=${encodeURIComponent(tokenId)}`);
+}
 
 // ── DNS / connectivity check (run at startup) ─────────────
 let _networkOk = null;   // null = not checked yet
@@ -105,7 +270,8 @@ async function apiFetch(url, opts = {}, retries = 2) {
 
     try {
       const r = await fetch(url, {
-        ...opts,
+        method: opts.method || 'GET',
+        body:   opts.body,
         signal: controller.signal,
         headers: {
           'Content-Type': 'application/json',
@@ -117,6 +283,7 @@ async function apiFetch(url, opts = {}, retries = 2) {
       clearTimeout(timer);
 
       if (!r.ok) {
+        if (opts.allow404 && r.status === 404) return null;
         const t = await r.text().catch(() => '');
         throw new Error(`HTTP ${r.status}: ${t.slice(0, 200)}`);
       }
@@ -215,26 +382,38 @@ async function generateClobCreds(wallet) {
 // ══════════════════════════════════════════════════════════
 
 async function getProfile(address) {
-  const d = await apiFetch(`${DATA}/profiles?address=${encodeURIComponent(address)}`);
-  const p = Array.isArray(d) ? d[0] : (d || {});
+  const p = await fetchPublicProfile(address);
+  if (!p) {
+    return {
+      address,
+      username: null,
+      avatar: null,
+      bio: null,
+      cashBalance: 0,
+      realizedPnl: 0,
+      unrealizedPnl: 0,
+      totalVolume: 0,
+      tradesCount: 0,
+      tradingAddress: address,
+    };
+  }
   const username =
     p.name ||
-    p.username ||
     p.pseudonym ||
-    p.displayUsername ||
-    (p.twitterUsername && String(p.twitterUsername)) ||
-    p.ensName ||
+    p.username ||
+    (p.xUsername && String(p.xUsername)) ||
     null;
   return {
     address,
+    tradingAddress: p.proxyWallet || address,
     username,
-    avatar:         p.profileImage || p.image || null,
-    bio:            p.bio || null,
-    cashBalance:    safeNum(p.cashBalance, 0),
-    realizedPnl:    safeNum(p.realizedPnl, 0),
-    unrealizedPnl:  safeNum(p.unrealizedPnl, 0),
-    totalVolume:    safeNum(p.volume ?? p.totalVolume, 0),
-    tradesCount:    parseInt(p.tradesCount || p.numTrades || 0, 10) || 0,
+    avatar:        p.profileImage || null,
+    bio:           p.bio || null,
+    cashBalance:   safeNum(p.cashBalance ?? p.usdcBalance, 0),
+    realizedPnl:   safeNum(p.realizedPnl, 0),
+    unrealizedPnl: safeNum(p.unrealizedPnl, 0),
+    totalVolume:   safeNum(p.volume ?? p.totalVolume, 0),
+    tradesCount:   parseInt(p.tradesCount || p.numTrades || 0, 10) || 0,
   };
 }
 
@@ -252,8 +431,8 @@ async function getPositions(address) {
     outcome:       p.outcome,
     size:          safeNum(p.size, 0),
     avgPrice:      safeNum(p.avgPrice ?? p.averagePrice, 0),
-    currentPrice:  safeNum(p.currentPrice ?? p.price, 0),
-    pnl:           safeNum(p.unrealizedPnl ?? p.pnl, 0),
+    currentPrice:  safeNum(p.currentPrice ?? p.curPrice ?? p.price, 0),
+    pnl:           safeNum(p.cashPnl ?? p.unrealizedPnl ?? p.pnl, 0),
     currentValue:  safeNum(p.currentValue, 0),
     endDate:       p.endDate || null,
   })).filter(p => p.size > 0.001);
@@ -293,19 +472,56 @@ async function getTrades(address, limit = 100) {
     .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 }
 
-async function getPortfolio(address) {
-  const [prof, pos, trades] = await Promise.all([
-    getProfile(address).catch(() => ({})),
-    getPositions(address).catch(() => []),
-    getTrades(address, 30).catch(() => []),
+async function getPortfolio(signerAddress) {
+  const dataUser = await resolveDataUser(signerAddress);
+  const [gammaProf, pos, trades, chainCollateral] = await Promise.all([
+    (async () => {
+      let p = await fetchPublicProfile(signerAddress);
+      if (dataUser.toLowerCase() !== signerAddress.toLowerCase()) {
+        const p2 = await fetchPublicProfile(dataUser);
+        if (p2) p = p2;
+      }
+      return p;
+    })(),
+    getPositions(dataUser).catch(() => []),
+    getTrades(dataUser, 30).catch(() => []),
+    getCollateralBalance(dataUser).catch(() => null),
   ]);
+
+  const username =
+    gammaProf?.name ||
+    gammaProf?.pseudonym ||
+    gammaProf?.username ||
+    (gammaProf?.xUsername && String(gammaProf.xUsername)) ||
+    null;
+
+  const realizedFromPos = pos.reduce((s, p) => s + safeNum(p.realizedPnl, 0), 0);
+  const unrealFromPos   = pos.reduce((s, p) => s + safeNum(p.cashPnl ?? p.pnl, 0), 0);
+  const gammaCash       = safeNum(gammaProf?.cashBalance ?? gammaProf?.usdcBalance, 0);
+  const useChain        = chainCollateral != null && Number.isFinite(chainCollateral);
+  const cashBalance     = useChain ? chainCollateral : gammaCash;
+
   return {
-    ...prof,
-    address:      prof.address || address,
-    positions:    pos,
-    recentTrades: trades,
-    posCount:     pos.length,
-    posValue:     pos.reduce((s, p) => s + safeNum(p.currentValue, safeNum(p.size, 0) * safeNum(p.currentPrice, 0)), 0),
+    address:           signerAddress,
+    tradingAddress:    dataUser,
+    polymarketProfileAddress: dataUser,
+    username,
+    avatar:            gammaProf?.profileImage || null,
+    bio:               gammaProf?.bio || null,
+    cashBalance,
+    cashBalanceSource: useChain ? 'chain' : 'gamma',
+    collateralToken:  collateralTokenAddress(),
+    realizedPnl:       safeNum(gammaProf?.realizedPnl, realizedFromPos) || realizedFromPos,
+    unrealizedPnl:     safeNum(gammaProf?.unrealizedPnl, unrealFromPos) || unrealFromPos,
+    totalVolume:       safeNum(gammaProf?.volume ?? gammaProf?.totalVolume, 0),
+    tradesCount:       parseInt(gammaProf?.tradesCount || gammaProf?.numTrades || 0, 10) || trades.length,
+    positions:         pos,
+    recentTrades:      trades,
+    posCount:          pos.length,
+    posValue:          pos.reduce(
+      (s, p) => s + safeNum(p.currentValue, safeNum(p.size, 0) * safeNum(p.currentPrice, 0)),
+      0,
+    ),
   };
 }
 
@@ -314,29 +530,71 @@ async function getPortfolio(address) {
 // ══════════════════════════════════════════════════════════
 
 async function getMarkets({ limit = 30, tag, search } = {}) {
-  const suffix = search
-    ? `&q=${encodeURIComponent(search)}`
-    : '';
-  let tagQS = '';
-  if (!search && tag) {
-    const tagId = await resolveTagId(tag);
-    if (tagId != null) tagQS = `&tag_id=${tagId}&related_tags=true`;
-    else console.warn(`[Markets] Unknown tag slug "${tag}" — returning unfiltered markets`);
+  const lim = Math.min(Math.max(parseInt(limit, 10) || 30, 1), 100);
+  const q   = search && String(search).trim();
+
+  if (q) {
+    const perType = Math.min(50, lim);
+    const d = await apiFetch(
+      `${GAMMA}/public-search?q=${encodeURIComponent(q)}&events_status=active&limit_per_type=${perType}`,
+    );
+    const out   = [];
+    const seen  = new Set();
+    const pushM = (raw, ev) => {
+      const nm = normMarket(raw, eventToCtx(ev));
+      if (!nm.id || !nm.title || seen.has(nm.id)) return;
+      if (raw.closed || raw.archived) return;
+      seen.add(nm.id);
+      out.push(nm);
+    };
+    const evs = Array.isArray(d?.events) ? d.events : [];
+    for (const ev of evs) {
+      for (const m of ev.markets || []) pushM(m, ev);
+    }
+    const mk = Array.isArray(d?.markets) ? d.markets : [];
+    for (const m of mk) pushM(m, null);
+    return out.slice(0, lim);
   }
 
-  const baseQS = `active=true&closed=false&limit=${limit}&ascending=false`;
-  let url = `${GAMMA}/markets?${baseQS}&order=volume_24hr${suffix}${tagQS}`;
-  let d = await apiFetch(url);
-  if (!d) {
-    url = `${GAMMA}/markets?${baseQS}&order=volume24hr${suffix}${tagQS}`;
-    d = await apiFetch(url);
+  let tagQS = '';
+  if (tag) {
+    const tagId = await resolveTagId(tag);
+    if (tagId != null) tagQS = `&tag_id=${tagId}&related_tags=true`;
+    else console.warn(`[Markets] Unknown tag slug "${tag}" — returning unfiltered events`);
   }
-  const list = Array.isArray(d) ? d : (d?.markets || []);
-  return list.map(normMarket).filter(m => m.id && m.title);
+
+  const eventLimit = Math.min(100, Math.max(lim * 2, 40));
+  let url = `${GAMMA}/events?active=true&closed=false&limit=${eventLimit}&offset=0&order=volume_24hr&ascending=false${tagQS}`;
+  let events = await apiFetch(url);
+  if (!events) {
+    url = `${GAMMA}/events?active=true&closed=false&limit=${eventLimit}&offset=0&order=volume24hr&ascending=false${tagQS}`;
+    events = await apiFetch(url);
+  }
+  const arr = Array.isArray(events) ? events : [];
+  const out = [];
+  const seen = new Set();
+  for (const ev of arr) {
+    const evCtx = eventToCtx(ev);
+    for (const m of ev.markets || []) {
+      if (m.closed || m.archived) continue;
+      const nm = normMarket(m, evCtx);
+      if (!nm.id || !nm.title || seen.has(nm.id)) continue;
+      seen.add(nm.id);
+      out.push(nm);
+      if (out.length >= lim) return out;
+    }
+  }
+  return out;
 }
 
 async function getMarket(cid) {
-  const d = await apiFetch(`${GAMMA}/markets/${cid}`);
+  if (!cid) return null;
+  let d = await apiFetch(`${GAMMA}/markets/${encodeURIComponent(cid)}`);
+  if (!d) {
+    const arr = await apiFetch(`${GAMMA}/markets?condition_ids=${encodeURIComponent(cid)}&limit=1`);
+    const list = Array.isArray(arr) ? arr : [];
+    d = list[0] || null;
+  }
   return d ? normMarket(d) : null;
 }
 
@@ -344,8 +602,8 @@ async function searchMarkets(q, limit = 8) {
   return getMarkets({ limit, search: q });
 }
 
-function normMarket(m) {
-  const tokens = m.tokens || [];
+function normMarket(m, eventCtx) {
+  const tokens = buildTokensFromGamma(m);
   const yT = tokens.find(t => /yes/i.test(t.outcome)) || tokens[0] || {};
   const nT = tokens.find(t => /no/i.test(t.outcome))  || tokens[1] || {};
   const opArr = parseOutcomePriceArray(m);
@@ -353,7 +611,7 @@ function normMarket(m) {
   let yP = parseFloat(yT.price);
   if (!Number.isFinite(yP) && opArr.length >= 1) yP = opArr[0];
   if (!Number.isFinite(yP) && m.outcomePrices != null) {
-    const raw = Array.isArray(m.outcomePrices) ? m.outcomePrices[0] : null;
+    const raw = parseJsonArray(m.outcomePrices)[0];
     yP = parseFloat(raw);
   }
   if (!Number.isFinite(yP) || yP < 0 || yP > 1) yP = 0.5;
@@ -363,17 +621,29 @@ function normMarket(m) {
   if (!Number.isFinite(nP) || nP < 0 || nP > 1) nP = Math.max(0, Math.min(1, 1 - yP));
 
   const vol24 = safeNum(m.volume24hr ?? m.volume24hNum ?? m.volume24hrClob, 0);
-  const liq   = safeNum(m.liquidity ?? m.liquidityNum ?? m.liquidityClob, 0);
-  const vol   = safeNum(m.volume, 0);
+  const liq   = safeNum(m.liquidityNum ?? m.liquidity ?? m.liquidityClob, 0);
+  const vol   = safeNum(m.volumeNum ?? m.volume ?? m.volumeClob, 0);
+
+  const tagLabels = (m.tags || []).map(t => (typeof t === 'object' ? (t.label || t.slug) : t)).filter(Boolean);
+  const evTags    = (eventCtx?.tags || []).map(t => (typeof t === 'object' ? (t.label || t.slug) : t)).filter(Boolean);
+  const mergedTags = [...new Set([...tagLabels, ...evTags])];
+
+  const img =
+    m.image ||
+    m.icon ||
+    m.twitterCardImage ||
+    eventCtx?.image ||
+    eventCtx?.icon ||
+    null;
 
   return {
     id:          m.conditionId || m.id,
     slug:        m.slug,
-    title:       m.question || m.title,
+    title:       m.question || m.title || eventCtx?.eventTitle,
     description: m.description,
-    category:    m.category || (m.tags?.[0]?.label) || 'General',
-    tags:        (m.tags || []).map(t => (typeof t === 'object' ? (t.label || t.slug) : t)).filter(Boolean),
-    image:       m.image || m.featuredImage || null,
+    category:    m.category || eventCtx?.category || (mergedTags[0]) || 'General',
+    tags:        mergedTags.length ? mergedTags : tagLabels,
+    image:       img,
     endDate:     m.endDateIso || m.endDate,
     yesPrice:    yP,
     noPrice:     nP,
@@ -382,8 +652,8 @@ function normMarket(m) {
     volume:      vol,
     volume24h:   vol24,
     liquidity:   liq,
-    yesTokenId:  yT.tokenId || m.clobTokenIds?.[0],
-    noTokenId:   nT.tokenId || m.clobTokenIds?.[1],
+    yesTokenId:  yT.tokenId || parseJsonArray(m.clobTokenIds)[0],
+    noTokenId:   nT.tokenId || parseJsonArray(m.clobTokenIds)[1],
     conditionId: m.conditionId,
     spread:      Math.abs(yP + nP - 1),
     outcomes:    tokens.map(t => ({
@@ -399,35 +669,31 @@ function normMarket(m) {
 // ══════════════════════════════════════════════════════════
 
 async function getLeaderboard(limit = 25) {
-  const candidates = [
-    `${DATA}/leaderboard?limit=${limit}&window=all`,
-    `${DATA}/leaderboard?limit=${limit}&window=allTime`,
-  ];
-  let d = null;
-  for (const u of candidates) {
-    d = await apiFetch(u);
-    const raw = Array.isArray(d) ? d : (d?.data ?? d?.leaderboard ?? d?.results ?? d?.items);
-    if (Array.isArray(raw) && raw.length) break;
-  }
-  const raw = Array.isArray(d) ? d : (d?.data ?? d?.leaderboard ?? d?.results ?? d?.items ?? []);
-  const list = (Array.isArray(raw) ? [...raw] : []).filter(t => t && (t.address || t.user || t.proxyWallet));
-  list.sort((a, b) =>
-    safeNum(b.profit ?? b.pnl ?? b.totalPnl, 0) - safeNum(a.profit ?? a.pnl ?? a.totalPnl, 0));
-  return list.slice(0, limit).map((t, i) => ({
-    rank:      i + 1,
-    address:   t.address || t.user || t.proxyWallet,
-    name:
-      t.name ||
-      t.username ||
-      t.pseudonym ||
-      (t.address ? t.address.slice(0, 8) + '…' : 'Trader'),
-    avatar:    t.profileImage || t.image || null,
-    profit:    safeNum(t.profit ?? t.pnl ?? t.totalPnl, 0),
-    roi:       safeNum(t.profitPct ?? t.roi, 0),
-    volume:    safeNum(t.volume, 0),
-    trades:    parseInt(t.tradesCount || t.numTrades || t.trades || 0, 10) || 0,
-    winRate:   safeNum(t.winRate, 0),
-  }));
+  const lim = Math.min(Math.max(parseInt(limit, 10) || 25, 1), 50);
+  const url = `${DATA}/v1/leaderboard?timePeriod=ALL&orderBy=PNL&limit=${lim}`;
+  const d   = await apiFetch(url);
+  const raw = Array.isArray(d) ? d : [];
+  const list = raw.filter(t => t && t.proxyWallet);
+  return list.map((t, i) => {
+    const addr = t.proxyWallet;
+    const nm   = t.userName || (addr ? addr.slice(0, 8) + '…' : 'Trader');
+    return {
+      rank:    parseInt(t.rank, 10) || i + 1,
+      address: addr,
+      name:    nm,
+      avatar:  t.profileImage || null,
+      profit:  safeNum(t.pnl, 0),
+      roi:     0,
+      volume:  safeNum(t.vol, 0),
+      trades:  0,
+      winRate: 0,
+    };
+  });
+}
+
+async function getUserValue(userAddress) {
+  if (!userAddress) return null;
+  return apiFetch(`${DATA}/value?user=${encodeURIComponent(userAddress)}`);
 }
 
 async function getTraderActivity(address, limit = 20) {
@@ -526,9 +792,13 @@ async function placeTrade({ wallet, creds, marketId, outcome, side = 'buy', amou
 
 module.exports = {
   checkNetwork, getNetworkStatus,
+  checkPolygonRpc, getPolygonRpcStatus,
   generateClobCreds,
   getProfile, getPositions, getTrades, getPortfolio,
   getMarkets, getMarket, searchMarkets,
-  getLeaderboard, getTraderActivity,
+  getLeaderboard, getTraderActivity, getUserValue,
+  getCollateralBalance, getIntegrationHealth, collateralTokenAddress,
+  getGammaTags,
+  clobTokenPrice, clobMidpoint, clobSpread, clobOrderBook,
   placeTrade,
 };

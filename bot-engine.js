@@ -6,7 +6,6 @@
  *   - Uses RiskManager for all pre-trade checks
  *   - Uses AIScorer to pick the best market
  *   - Places trades via CLOB v2 (server-side signing with private key)
- *   - Optionally uses Bullpen CLI as backup/alternative execution
  *   - Monitors stop-losses on existing positions
  *   - Maintains complete activity log
  * 
@@ -16,7 +15,6 @@
  */
 
 const pmAPI        = require('./polymarket-api');
-const bullpen      = require('./bullpen');
 const aiScorer     = require('./ai-scorer');
 
 const INTERVAL_MIN = parseInt(process.env.BOT_CHECK_INTERVAL_MIN) || 15;
@@ -34,7 +32,6 @@ class BotEngine {
 
     // Active market targets (user can queue specific markets to watch)
     this.targetMarkets = new Set();  // conditionIds the bot should prioritise
-    this.useBullpen    = false;      // If true, executes via Bullpen CLI instead of CLOB v2
   }
 
   // ── Logging ──────────────────────────────────────────
@@ -56,8 +53,6 @@ class BotEngine {
     if (opts.maxExposure)   this.riskManager.updateConfig({ maxExposurePct: opts.maxExposure });
     if (opts.stopLoss)      this.riskManager.updateConfig({ stopLossPct:    opts.stopLoss });
     if (opts.minScore)      this.riskManager.updateConfig({ minScore:       opts.minScore });
-    if (opts.useBullpen !== undefined) this.useBullpen = opts.useBullpen;
-
     this.running = true;
     this.log(`Bot started | ${this.riskManager.config.dailyLimit} trades/day | ${this.riskManager.config.maxBudgetPct}% budget | Stop-loss ${this.riskManager.config.stopLossPct}%`);
 
@@ -193,23 +188,10 @@ class BotEngine {
     }
   }
 
-  // ── Execute a BUY (CLOB v2 or Bullpen) ───────────────
+  // ── Execute a BUY (CLOB v2) ───────────────────────────
   async _executeBuy({ marketId, slug, outcome, amount, title }) {
     this.log(`Executing BUY ${outcome} $${amount.toFixed(2)} on "${title}"…`);
 
-    if (this.useBullpen && slug) {
-      // Bullpen CLI execution
-      const r = await bullpen.buyShares(slug, outcome, amount, true);
-      if (!r.ok) throw new Error(`Bullpen buy failed: ${r.error || r.raw}`);
-      this.log(`Bullpen: ${r.raw.slice(0, 100)}`);
-      return {
-        success: true, simulated: false, orderId: `BULLPEN_${Date.now()}`,
-        market: title, marketId, outcome, side: 'buy', amount,
-        source: 'bullpen', cmd: r.cmd,
-      };
-    }
-
-    // CLOB v2 direct execution
     const result = await pmAPI.placeTrade({
       wallet: this.wallet, creds: this.creds,
       marketId, outcome, side: 'buy', amount,
@@ -227,21 +209,13 @@ class BotEngine {
   async _executeSell(marketId, outcome, size, reason) {
     this.log(`Executing SELL ${outcome} ${size} shares — ${reason}`);
     try {
-      if (this.useBullpen) {
-        const market = await pmAPI.getMarket(marketId);
-        const slug   = market?.slug || marketId;
-        const r      = await bullpen.sellShares(slug, outcome, size, true);
-        if (r.ok) this.log(`Stop-loss sell executed via Bullpen`);
-        else      this.log(`Stop-loss sell failed: ${r.error}`, 'warn');
-      } else {
-        const result = await pmAPI.placeTrade({
-          wallet: this.wallet, creds: this.creds,
-          marketId, outcome, side: 'sell', amount: size,
-        });
-        const record = { ...result, side: 'sell', pnl: 0 }; // PnL calculated by RiskManager
-        this.riskManager.recordTrade(record);
-        this.log(`Stop-loss sell: ${result.simulated ? 'signed' : 'live'} — ${result.orderId}`);
-      }
+      const result = await pmAPI.placeTrade({
+        wallet: this.wallet, creds: this.creds,
+        marketId, outcome, side: 'sell', amount: size,
+      });
+      const record = { ...result, side: 'sell', pnl: 0 };
+      this.riskManager.recordTrade(record);
+      this.log(`Stop-loss sell: ${result.simulated ? 'signed' : 'live'} — ${result.orderId}`);
     } catch (e) {
       this.log(`Stop-loss sell error: ${e.message}`, 'error');
     }
@@ -277,7 +251,6 @@ class BotEngine {
       cycleCount:   this.cycleCount,
       lastCycle:    this.lastCycle,
       logs:         this.logs,
-      useBullpen:   this.useBullpen,
       targetMarkets: [...this.targetMarkets],
       config:       this.riskManager.getConfig(),
       pnl:          this.riskManager.getPnLSummary(),
