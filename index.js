@@ -124,11 +124,30 @@ app.get('/api/status', async (req, res) => {
 // PORTFOLIO
 // ═══════════════════════════════════════════════════════════
 
-app.get('/api/portfolio', requireWallet, async (req, res) => {
+app.get('/api/portfolio', async (req, res) => {
   try {
+    if (!wallet) {
+      return res.json({
+        address:           null,
+        username:          null,
+        avatar:            null,
+        bio:               null,
+        cashBalance:       0,
+        realizedPnl:       0,
+        unrealizedPnl:     0,
+        totalVolume:       0,
+        tradesCount:       0,
+        positions:         [],
+        recentTrades:      [],
+        posCount:          0,
+        posValue:          0,
+        riskPnl:           riskManager.getPnLSummary(),
+        walletConfigured:  false,
+      });
+    }
     const portfolio = await pmAPI.getPortfolio(wallet.address);
-    // Enrich with risk manager PnL data
     portfolio.riskPnl = riskManager.getPnLSummary();
+    portfolio.walletConfigured = true;
     res.json(portfolio);
   } catch (e) {
     res.status(500).json({ error: e.message });
