@@ -22,6 +22,53 @@ const GAMMA = 'https://gamma-api.polymarket.com';
 const DATA  = 'https://data-api.polymarket.com';
 const CLOB  = 'https://clob.polymarket.com';
 
+/** Gamma filters markets by numeric tag_id; ?tag=slug is ignored — map UI slugs → API slugs */
+const TAG_SLUG_ALIASES = {
+  tech: 'technology',
+  culture: 'pop-culture',
+  economy: 'economics',
+  cricket: 'cricket',
+};
+
+let _tagsSlugToId = null;
+let _tagsFetchedAt = 0;
+const TAG_CACHE_MS = 3600000;
+
+async function resolveTagId(tagSlug) {
+  if (!tagSlug || typeof tagSlug !== 'string') return null;
+  const raw = tagSlug.trim().toLowerCase();
+  const trySlug = TAG_SLUG_ALIASES[raw] || raw;
+
+  const now = Date.now();
+  if (!_tagsSlugToId || now - _tagsFetchedAt > TAG_CACHE_MS) {
+    const d = await apiFetch(`${GAMMA}/tags?limit=2000`);
+    const arr = Array.isArray(d) ? d : (d?.data || []);
+    _tagsSlugToId = new Map();
+    for (const t of arr) {
+      const slug = (t.slug || '').toLowerCase();
+      const id   = t.id;
+      if (slug && id != null) _tagsSlugToId.set(slug, id);
+    }
+    _tagsFetchedAt = now;
+  }
+
+  let id = _tagsSlugToId.get(trySlug);
+  if (id == null && trySlug !== raw) id = _tagsSlugToId.get(raw);
+  return id != null ? id : null;
+}
+
+function parseOutcomePriceArray(m) {
+  let op = m.outcomePrices;
+  if (typeof op === 'string') {
+    try {
+      op = JSON.parse(op);
+    } catch {
+      op = [];
+    }
+  }
+  return Array.isArray(op) ? op.map(x => parseFloat(x)).filter(n => Number.isFinite(n)) : [];
+}
+
 const CTF_EXCHANGE  = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
 const USDC_DECIMALS = 6;
 
@@ -168,19 +215,32 @@ async function generateClobCreds(wallet) {
 // ══════════════════════════════════════════════════════════
 
 async function getProfile(address) {
-  const d = await apiFetch(`${DATA}/profiles?address=${address}`);
+  const d = await apiFetch(`${DATA}/profiles?address=${encodeURIComponent(address)}`);
   const p = Array.isArray(d) ? d[0] : (d || {});
+  const username =
+    p.name ||
+    p.username ||
+    p.pseudonym ||
+    p.displayUsername ||
+    (p.twitterUsername && String(p.twitterUsername)) ||
+    p.ensName ||
+    null;
   return {
     address,
-    username:       p.name || p.pseudonym || null,
-    avatar:         p.profileImage || null,
+    username,
+    avatar:         p.profileImage || p.image || null,
     bio:            p.bio || null,
-    cashBalance:    parseFloat(p.cashBalance      || 0),
-    realizedPnl:    parseFloat(p.realizedPnl      || 0),
-    unrealizedPnl:  parseFloat(p.unrealizedPnl    || 0),
-    totalVolume:    parseFloat(p.volume           || p.totalVolume || 0),
-    tradesCount:    parseInt(p.tradesCount        || 0),
+    cashBalance:    safeNum(p.cashBalance, 0),
+    realizedPnl:    safeNum(p.realizedPnl, 0),
+    unrealizedPnl:  safeNum(p.unrealizedPnl, 0),
+    totalVolume:    safeNum(p.volume ?? p.totalVolume, 0),
+    tradesCount:    parseInt(p.tradesCount || p.numTrades || 0, 10) || 0,
   };
+}
+
+function safeNum(v, fallback = 0) {
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 async function getPositions(address) {
@@ -190,34 +250,43 @@ async function getPositions(address) {
     conditionId:   p.conditionId || p.market,
     title:         p.title || p.marketTitle || p.question || 'Unknown',
     outcome:       p.outcome,
-    size:          parseFloat(p.size || 0),
-    avgPrice:      parseFloat(p.avgPrice || p.averagePrice || 0),
-    currentPrice:  parseFloat(p.currentPrice || p.price || 0),
-    pnl:           parseFloat(p.unrealizedPnl || p.pnl || 0),
-    currentValue:  parseFloat(p.currentValue || 0),
+    size:          safeNum(p.size, 0),
+    avgPrice:      safeNum(p.avgPrice ?? p.averagePrice, 0),
+    currentPrice:  safeNum(p.currentPrice ?? p.price, 0),
+    pnl:           safeNum(p.unrealizedPnl ?? p.pnl, 0),
+    currentValue:  safeNum(p.currentValue, 0),
     endDate:       p.endDate || null,
   })).filter(p => p.size > 0.001);
 }
 
 async function getTrades(address, limit = 100) {
-  const [ra, rb] = await Promise.allSettled([
-    apiFetch(`${DATA}/activity?user=${address}&limit=${limit}`),
-    apiFetch(`${DATA}/trades?maker=${address}&limit=${limit}`),
-  ]);
-  const la = ra.status === 'fulfilled' && ra.value ? (Array.isArray(ra.value) ? ra.value : ra.value.data || []) : [];
-  const lb = rb.status === 'fulfilled' && rb.value ? (Array.isArray(rb.value) ? rb.value : rb.value.data || []) : [];
+  const addr = (address || '').toLowerCase();
+  const d = await apiFetch(`${DATA}/activity?user=${encodeURIComponent(address)}&limit=${limit}`);
+  const la = d ? (Array.isArray(d) ? d : (d.data || d.results || [])) : [];
+
+  const rows = la.filter(t => {
+    const u = (t.user || t.proxyWallet || t.makerAddress || '').toLowerCase();
+    if (!u) return true;
+    return u === addr;
+  });
+
   const seen = new Set();
-  return [...la, ...lb]
-    .filter(t => { const id = t.id || t.tradeId || JSON.stringify(t).slice(0,32); if (seen.has(id)) return false; seen.add(id); return true; })
+  return rows
+    .filter(t => {
+      const id = t.id || t.tradeId || t.transactionHash || JSON.stringify(t).slice(0, 48);
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    })
     .map(t => ({
       id:        t.id || t.tradeId,
       market:    t.market || t.conditionId,
       title:     t.title || t.marketTitle || t.question || 'Unknown',
       outcome:   t.outcome,
       side:      t.side,
-      price:     parseFloat(t.price || 0),
-      size:      parseFloat(t.size || 0),
-      usdcValue: parseFloat(t.usdcValue || t.amount || (t.price * t.size) || 0),
+      price:     safeNum(t.price, 0),
+      size:      safeNum(t.size, 0),
+      usdcValue: safeNum(t.usdcValue ?? t.amount ?? (t.price && t.size ? t.price * t.size : 0), 0),
       timestamp: t.timestamp || t.createdAt,
       txHash:    t.transactionHash || null,
     }))
@@ -232,10 +301,11 @@ async function getPortfolio(address) {
   ]);
   return {
     ...prof,
+    address:      prof.address || address,
     positions:    pos,
     recentTrades: trades,
     posCount:     pos.length,
-    posValue:     pos.reduce((s, p) => s + (p.currentValue || p.size * p.currentPrice || 0), 0),
+    posValue:     pos.reduce((s, p) => s + safeNum(p.currentValue, safeNum(p.size, 0) * safeNum(p.currentPrice, 0)), 0),
   };
 }
 
@@ -244,11 +314,25 @@ async function getPortfolio(address) {
 // ══════════════════════════════════════════════════════════
 
 async function getMarkets({ limit = 30, tag, search } = {}) {
-  let url = `${GAMMA}/markets?active=true&closed=false&limit=${limit}&order=volume24hr&ascending=false`;
-  if (tag)    url += `&tag=${encodeURIComponent(tag)}`;
-  if (search) url += `&q=${encodeURIComponent(search)}`;
-  const d = await apiFetch(url);
-  return (Array.isArray(d) ? d : (d?.markets || [])).map(normMarket).filter(m => m.id && m.title);
+  const suffix = search
+    ? `&q=${encodeURIComponent(search)}`
+    : '';
+  let tagQS = '';
+  if (!search && tag) {
+    const tagId = await resolveTagId(tag);
+    if (tagId != null) tagQS = `&tag_id=${tagId}&related_tags=true`;
+    else console.warn(`[Markets] Unknown tag slug "${tag}" — returning unfiltered markets`);
+  }
+
+  const baseQS = `active=true&closed=false&limit=${limit}&ascending=false`;
+  let url = `${GAMMA}/markets?${baseQS}&order=volume_24hr${suffix}${tagQS}`;
+  let d = await apiFetch(url);
+  if (!d) {
+    url = `${GAMMA}/markets?${baseQS}&order=volume24hr${suffix}${tagQS}`;
+    d = await apiFetch(url);
+  }
+  const list = Array.isArray(d) ? d : (d?.markets || []);
+  return list.map(normMarket).filter(m => m.id && m.title);
 }
 
 async function getMarket(cid) {
@@ -264,29 +348,49 @@ function normMarket(m) {
   const tokens = m.tokens || [];
   const yT = tokens.find(t => /yes/i.test(t.outcome)) || tokens[0] || {};
   const nT = tokens.find(t => /no/i.test(t.outcome))  || tokens[1] || {};
-  const yP = parseFloat(yT.price ?? m.outcomePrices?.[0] ?? 0.5);
-  const nP = parseFloat(nT.price ?? (1 - yP));
+  const opArr = parseOutcomePriceArray(m);
+
+  let yP = parseFloat(yT.price);
+  if (!Number.isFinite(yP) && opArr.length >= 1) yP = opArr[0];
+  if (!Number.isFinite(yP) && m.outcomePrices != null) {
+    const raw = Array.isArray(m.outcomePrices) ? m.outcomePrices[0] : null;
+    yP = parseFloat(raw);
+  }
+  if (!Number.isFinite(yP) || yP < 0 || yP > 1) yP = 0.5;
+
+  let nP = parseFloat(nT.price);
+  if (!Number.isFinite(nP) && opArr.length >= 2) nP = opArr[1];
+  if (!Number.isFinite(nP) || nP < 0 || nP > 1) nP = Math.max(0, Math.min(1, 1 - yP));
+
+  const vol24 = safeNum(m.volume24hr ?? m.volume24hNum ?? m.volume24hrClob, 0);
+  const liq   = safeNum(m.liquidity ?? m.liquidityNum ?? m.liquidityClob, 0);
+  const vol   = safeNum(m.volume, 0);
+
   return {
     id:          m.conditionId || m.id,
     slug:        m.slug,
     title:       m.question || m.title,
     description: m.description,
     category:    m.category || (m.tags?.[0]?.label) || 'General',
-    tags:        (m.tags || []).map(t => t.label || t.slug || t),
+    tags:        (m.tags || []).map(t => (typeof t === 'object' ? (t.label || t.slug) : t)).filter(Boolean),
     image:       m.image || m.featuredImage || null,
     endDate:     m.endDateIso || m.endDate,
     yesPrice:    yP,
     noPrice:     nP,
     yesPct:      Math.round(yP * 100),
     noPct:       Math.round(nP * 100),
-    volume:      parseFloat(m.volume || 0),
-    volume24h:   parseFloat(m.volume24hr || m.volume24hNum || 0),
-    liquidity:   parseFloat(m.liquidity || m.liquidityNum || 0),
+    volume:      vol,
+    volume24h:   vol24,
+    liquidity:   liq,
     yesTokenId:  yT.tokenId || m.clobTokenIds?.[0],
     noTokenId:   nT.tokenId || m.clobTokenIds?.[1],
     conditionId: m.conditionId,
     spread:      Math.abs(yP + nP - 1),
-    outcomes:    tokens.map(t => ({ label: t.outcome, price: parseFloat(t.price || 0), tokenId: t.tokenId })),
+    outcomes:    tokens.map(t => ({
+      label:   t.outcome,
+      price:   safeNum(t.price, 0),
+      tokenId: t.tokenId,
+    })),
   };
 }
 
@@ -295,17 +399,34 @@ function normMarket(m) {
 // ══════════════════════════════════════════════════════════
 
 async function getLeaderboard(limit = 25) {
-  const d = await apiFetch(`${DATA}/leaderboard?limit=${limit}&window=allTime`);
-  return (Array.isArray(d) ? d : (d?.data || [])).map((t, i) => ({
+  const candidates = [
+    `${DATA}/leaderboard?limit=${limit}&window=all`,
+    `${DATA}/leaderboard?limit=${limit}&window=allTime`,
+  ];
+  let d = null;
+  for (const u of candidates) {
+    d = await apiFetch(u);
+    const raw = Array.isArray(d) ? d : (d?.data ?? d?.leaderboard ?? d?.results ?? d?.items);
+    if (Array.isArray(raw) && raw.length) break;
+  }
+  const raw = Array.isArray(d) ? d : (d?.data ?? d?.leaderboard ?? d?.results ?? d?.items ?? []);
+  const list = (Array.isArray(raw) ? [...raw] : []).filter(t => t && (t.address || t.user || t.proxyWallet));
+  list.sort((a, b) =>
+    safeNum(b.profit ?? b.pnl ?? b.totalPnl, 0) - safeNum(a.profit ?? a.pnl ?? a.totalPnl, 0));
+  return list.slice(0, limit).map((t, i) => ({
     rank:      i + 1,
-    address:   t.address,
-    name:      t.name || t.pseudonym || (t.address?.slice(0, 8) + '…'),
-    avatar:    t.profileImage || null,
-    profit:    parseFloat(t.profit || t.pnl || 0),
-    roi:       parseFloat(t.profitPct || t.roi || 0),
-    volume:    parseFloat(t.volume || 0),
-    trades:    parseInt(t.tradesCount || t.numTrades || 0),
-    winRate:   parseFloat(t.winRate || 0),
+    address:   t.address || t.user || t.proxyWallet,
+    name:
+      t.name ||
+      t.username ||
+      t.pseudonym ||
+      (t.address ? t.address.slice(0, 8) + '…' : 'Trader'),
+    avatar:    t.profileImage || t.image || null,
+    profit:    safeNum(t.profit ?? t.pnl ?? t.totalPnl, 0),
+    roi:       safeNum(t.profitPct ?? t.roi, 0),
+    volume:    safeNum(t.volume, 0),
+    trades:    parseInt(t.tradesCount || t.numTrades || t.trades || 0, 10) || 0,
+    winRate:   safeNum(t.winRate, 0),
   }));
 }
 
