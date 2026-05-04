@@ -7,7 +7,7 @@
  * All endpoints:
  *   GET  /api/status          → server + bot + wallet status
  *   GET  /api/portfolio       → balance, positions, trades, PnL
- *   GET  /api/markets         → active markets (with optional ?tag= ?search=)
+ *   GET  /api/markets         → active markets (?tag= ?search= ?limit= ?offset= event pagination)
  *   GET  /api/leaderboard     → top traders
  *   GET  /api/trader/:addr    → specific trader activity
  *   GET  /api/suggestions     → AI trade suggestions
@@ -156,8 +156,13 @@ app.get('/api/portfolio', async (req, res) => {
 
 app.get('/api/markets', async (req, res) => {
   try {
-    const { tag, search, limit = 40 } = req.query;
-    const markets = await pmAPI.getMarkets({ tag, search, limit: parseInt(limit) });
+    const { tag, search, limit = 80, offset } = req.query;
+    const markets = await pmAPI.getMarkets({
+      tag,
+      search,
+      limit: parseInt(limit, 10),
+      offset: offset != null ? parseInt(offset, 10) : 0,
+    });
     res.json(markets);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -208,7 +213,7 @@ app.get('/api/suggestions', requireWallet, async (req, res) => {
   try {
     const [portfolio, markets, leaderboard] = await Promise.all([
       pmAPI.getPortfolio(wallet.address),
-      pmAPI.getMarkets({ limit: 60 }),
+      pmAPI.getMarkets({ limit: 100 }),
       pmAPI.getLeaderboard(10),
     ]);
     const suggestions = await aiScorer.generateSuggestions({
@@ -230,7 +235,7 @@ app.post('/api/ai/analyze', requireWallet, async (req, res) => {
     if (!message) return res.status(400).json({ error: 'message required' });
 
     const portfolio = await pmAPI.getPortfolio(wallet.address).catch(() => ({ cashBalance: 0 }));
-    const markets   = await pmAPI.getMarkets({ limit: 40 }).catch(() => []);
+    const markets   = await pmAPI.getMarkets({ limit: 80 }).catch(() => []);
 
     const result = await aiScorer.analyzeWithClaude({
       userMessage: message,

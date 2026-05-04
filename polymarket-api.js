@@ -529,12 +529,56 @@ async function getPortfolio(signerAddress) {
 // MARKETS
 // ══════════════════════════════════════════════════════════
 
-async function getMarkets({ limit = 30, tag, search } = {}) {
-  const lim = Math.min(Math.max(parseInt(limit, 10) || 30, 1), 100);
+/** Keywords to keep a market when Gamma returns loosely-related events (related_tags) */
+const TAG_TOPIC_HINTS = {
+  cricket:   ['cricket', 'ipl', 'ashes', 'bbl', 'psl', 't20', 'odi', 'wc ', 'world cup', 'test match', 'wtc'],
+  sports:    ['sport', 'nfl', 'nba', 'mlb', 'nhl', 'ufc', 'soccer', 'football', 'f1', 'tennis', 'golf', 'olymp', 'super bowl', 'playoff'],
+  politics:  ['politic', 'election', 'president', 'senate', 'congress', 'democrat', 'republican', 'parliament', 'vote', 'trump', 'biden'],
+  crypto:    ['crypto', 'bitcoin', 'btc', 'ethereum', 'eth', 'solana', 'defi', 'token', 'etf'],
+  economics: ['econom', 'fed ', 'gdp', 'inflation', 'recession', 'interest rate', 'jobs report', 'cpi ', 'stock', 's&p', 'nasdaq'],
+  economy:   ['econom', 'fed ', 'gdp', 'inflation', 'recession', 'interest rate', 'jobs report', 'cpi ', 'stock', 's&p', 'nasdaq'],
+  technology: ['tech', ' ai', 'openai', 'google', 'apple', 'meta ', 'microsoft', 'tesla', 'chip', 'software', 'amazon'],
+  'pop-culture': ['oscar', 'grammy', 'celebr', 'movie', 'album', 'culture', 'entertainment', 'tv ', 'netflix', 'music'],
+};
+
+function topicBlob(m) {
+  const tags = (m.tags || []).map(t => String(t).toLowerCase());
+  return [
+    (m.title || '').toLowerCase(),
+    (m.category || '').toLowerCase(),
+    ...tags,
+  ].join(' ');
+}
+
+/**
+ * True if market plausibly belongs to this UI category (stops Politics cards appearing under Cricket).
+ */
+function marketMatchesTopic(m, tagSlug) {
+  if (!tagSlug) return true;
+  const raw = String(tagSlug).trim().toLowerCase();
+  const canonical = TAG_SLUG_ALIASES[raw] || raw;
+  const hints = TAG_TOPIC_HINTS[canonical] || TAG_TOPIC_HINTS[raw] || [canonical];
+  const blob = topicBlob(m);
+  if (hints.some(h => blob.includes(h))) return true;
+  if (tagsMatchSlug(m.tags, canonical) || tagsMatchSlug(m.tags, raw)) return true;
+  return false;
+}
+
+function tagsMatchSlug(tags, slug) {
+  if (!slug || !Array.isArray(tags)) return false;
+  const s = slug.toLowerCase();
+  return tags.some(t => {
+    const x = String(t).toLowerCase();
+    return x === s || x.endsWith(s) || x.includes(s) || s.includes(x);
+  });
+}
+
+async function getMarkets({ limit = 40, tag, search, offset: startOffset } = {}) {
+  const lim = Math.min(Math.max(parseInt(limit, 10) || 40, 1), 200);
   const q   = search && String(search).trim();
 
   if (q) {
-    const perType = Math.min(50, lim);
+    const perType = Math.min(80, Math.max(lim, 20));
     const d = await apiFetch(
       `${GAMMA}/public-search?q=${encodeURIComponent(q)}&events_status=active&limit_per_type=${perType}`,
     );
@@ -556,34 +600,82 @@ async function getMarkets({ limit = 30, tag, search } = {}) {
     return out.slice(0, lim);
   }
 
-  let tagQS = '';
-  if (tag) {
-    const tagId = await resolveTagId(tag);
-    if (tagId != null) tagQS = `&tag_id=${tagId}&related_tags=true`;
-    else console.warn(`[Markets] Unknown tag slug "${tag}" — returning unfiltered events`);
+  const tagRaw = tag && String(tag).trim();
+  if (tagRaw) {
+    const tagId = await resolveTagId(tagRaw);
+    if (tagId == null) {
+      console.warn(`[Markets] Unknown tag slug "${tagRaw}" — using search fallback`);
+      return getMarkets({ limit: lim, search: tagRaw });
+    }
+
+    const trySlug = TAG_SLUG_ALIASES[tagRaw.toLowerCase()] || tagRaw.toLowerCase();
+    const poolCap = Math.min(500, Math.max(lim * 5, 120));
+    const pool = await fetchMarketsFromEvents({
+      lim: poolCap,
+      tagId,
+      startOffset,
+    });
+    const filtered = pool.filter(m => marketMatchesTopic(m, trySlug));
+    const minKeep = Math.min(10, Math.ceil(lim * 0.25));
+    if (filtered.length >= minKeep) return filtered.slice(0, lim);
+    if (filtered.length > 0) return filtered.slice(0, lim);
+    return pool.slice(0, lim);
   }
 
-  const eventLimit = Math.min(100, Math.max(lim * 2, 40));
-  let url = `${GAMMA}/events?active=true&closed=false&limit=${eventLimit}&offset=0&order=volume_24hr&ascending=false${tagQS}`;
-  let events = await apiFetch(url);
-  if (!events) {
-    url = `${GAMMA}/events?active=true&closed=false&limit=${eventLimit}&offset=0&order=volume24hr&ascending=false${tagQS}`;
-    events = await apiFetch(url);
-  }
-  const arr = Array.isArray(events) ? events : [];
+  return fetchMarketsFromEvents({
+    lim,
+    tagId: null,
+    startOffset,
+  });
+}
+
+/**
+ * Walks Gamma /events with pagination until we collect `lim` unique markets (broader coverage than a single page).
+ */
+async function fetchMarketsFromEvents({ lim, tagId, startOffset = 0 }) {
   const out = [];
   const seen = new Set();
-  for (const ev of arr) {
-    const evCtx = eventToCtx(ev);
-    for (const m of ev.markets || []) {
-      if (m.closed || m.archived) continue;
-      const nm = normMarket(m, evCtx);
-      if (!nm.id || !nm.title || seen.has(nm.id)) continue;
-      seen.add(nm.id);
-      out.push(nm);
-      if (out.length >= lim) return out;
-    }
+  let offset = Math.max(0, parseInt(startOffset, 10) || 0);
+  const eventPage = 100;
+  const maxPages = 12;
+
+  let tagQS = '';
+  let useRelated = false;
+  if (tagId != null) {
+    tagQS = `&tag_id=${tagId}&related_tags=false`;
   }
+
+  for (let page = 0; page < maxPages && out.length < lim; page++) {
+    let url = `${GAMMA}/events?active=true&closed=false&limit=${eventPage}&offset=${offset}&order=volume_24hr&ascending=false${tagQS}`;
+    let events = await apiFetch(url);
+    if (!events) {
+      url = `${GAMMA}/events?active=true&closed=false&limit=${eventPage}&offset=${offset}&order=volume24hr&ascending=false${tagQS}`;
+      events = await apiFetch(url);
+    }
+    const arr = Array.isArray(events) ? events : [];
+
+    if (tagId != null && page === 0 && arr.length === 0 && !useRelated) {
+      tagQS = `&tag_id=${tagId}&related_tags=true`;
+      useRelated = true;
+      continue;
+    }
+
+    for (const ev of arr) {
+      const evCtx = eventToCtx(ev);
+      for (const m of ev.markets || []) {
+        if (m.closed || m.archived) continue;
+        const nm = normMarket(m, evCtx);
+        if (!nm.id || !nm.title || seen.has(nm.id)) continue;
+        seen.add(nm.id);
+        out.push(nm);
+        if (out.length >= lim) return out;
+      }
+    }
+
+    if (arr.length < eventPage) break;
+    offset += eventPage;
+  }
+
   return out;
 }
 

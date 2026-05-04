@@ -97,7 +97,13 @@ class BotEngine {
 
       const balance   = portfolio.cashBalance || 0;
       const positions = portfolio.positions   || [];
-      const posValue  = positions.reduce((s, p) => s + (p.currentValue || 0), 0);
+      const posValue  = positions.reduce((s, p) => {
+        const cv = p.currentValue;
+        if (cv != null && Number.isFinite(cv) && cv > 0) return s + cv;
+        const sz = parseFloat(p.size) || 0;
+        const px = parseFloat(p.currentPrice) || 0;
+        return s + sz * px;
+      }, 0);
 
       this.log(`Balance: $${balance.toFixed(2)} | Positions: ${positions.length} ($${posValue.toFixed(2)})`);
 
@@ -130,7 +136,7 @@ class BotEngine {
       }
 
       // Supplement with general markets
-      const generalMarkets = await pmAPI.getMarkets({ limit: 60 });
+      const generalMarkets = await pmAPI.getMarkets({ limit: 120 });
       markets = [...markets, ...generalMarkets.filter(m => !this.targetMarkets.has(m.id))];
 
       this.log(`Analysing ${markets.length} markets…`);

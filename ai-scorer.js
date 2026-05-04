@@ -13,7 +13,7 @@ const pmAPI = require('./polymarket-api');
 const CLAUDE_MODEL = 'claude-sonnet-4-20250514';
 
 // ── Score a single market ─────────────────────────────────
-function scoreMarket(market, topTraderActivity = []) {
+function scoreMarket(market, topTraderActivity = [], leaderboard = []) {
   let score = 0;
   const reasons = [];
   const { yesPrice: yp, noPrice: np, volume24h: v24, liquidity: liq, endDate } = market;
@@ -39,7 +39,7 @@ function scoreMarket(market, topTraderActivity = []) {
   else if (v24 >= 1000)   { score += 8;  reasons.push('Low volume'); }
   else                    { score -= 5;  reasons.push('Very low vol — risky'); }
 
-  // Top trader signals (25 pts)
+  // Top trader signals (25 pts) — recent fills from leaderboard wallets on this market
   const bets = topTraderActivity.filter(t => t.market === market.id || t.market === market.conditionId);
   if (bets.length > 0) {
     const tally = {};
@@ -50,6 +50,15 @@ function scoreMarket(market, topTraderActivity = []) {
       score  += Math.min(bets.length * 8, 25);
       reasons.push(`${bets.length} top-traders → ${outcome}`);
     }
+  }
+
+  // Leaderboard PnL context (6 pts) — simple risk-on / quality signal, not stock-picking
+  const lb = Array.isArray(leaderboard) ? leaderboard.slice(0, 5) : [];
+  if (lb.length >= 3) {
+    const avgPnl = lb.reduce((s, t) => s + Math.max(0, parseFloat(t.profit) || 0), 0) / lb.length;
+    if (avgPnl >= 500_000)      { score += 6; reasons.push('Top-5 leaderboard PnL very strong'); }
+    else if (avgPnl >= 100_000) { score += 4; reasons.push('Top-5 leaderboard PnL solid'); }
+    else if (avgPnl >= 20_000)  { score += 2; reasons.push('Leaderboard context positive'); }
   }
 
   // Liquidity (15 pts)
@@ -119,7 +128,7 @@ async function selectBest({ balance, markets, leaderboard, positions = [], riskM
       m.yesPrice > 0.05 &&
       m.yesPrice < 0.95
     )
-    .map(m => scoreMarket(m, traderActivity))
+    .map(m => scoreMarket(m, traderActivity, leaderboard))
     .sort((a, b) => b.score - a.score);
 
   if (!ranked.length) return { action: null, reason: 'No suitable markets after filtering' };
@@ -174,7 +183,7 @@ async function generateSuggestions({ balance, markets, leaderboard, riskManager 
 
   const scored = markets
     .filter(m => m.volume24h > 200 && m.id)
-    .map(m => scoreMarket(m, traderActivity))
+    .map(m => scoreMarket(m, traderActivity, leaderboard))
     .sort((a, b) => b.score - a.score);
 
   const withSize = scored.map(s => ({
